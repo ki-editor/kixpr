@@ -7,16 +7,46 @@ pub struct Position {
     pub column_number: usize,
     pub character_index: usize,
 }
-
-#[derive(Debug, PartialEq)]
-pub struct Token {
-    pub kind: TokenKind,
-    pub start_position: Position,
-    pub end_position: Position,
+impl Position {
+    fn min(&self, other: &Position) -> Position {
+        Position {
+            line_number: self.line_number.min(other.line_number),
+            column_number: self.column_number.min(other.column_number),
+            character_index: self.character_index.min(other.character_index),
+        }
+    }
+    fn max(&self, other: &Position) -> Position {
+        Position {
+            line_number: self.line_number.max(other.line_number),
+            column_number: self.column_number.max(other.column_number),
+            character_index: self.character_index.max(other.character_index),
+        }
+    }
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone, Copy)]
+pub struct Span {
+    pub start: Position,
+    pub end: Position,
+}
+impl Span {
+    pub(crate) fn join(&self, other: &Span) -> Span {
+        Span {
+            start: self.start.min(&other.start),
+            end: self.end.max(&other.end),
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Clone)]
+pub struct Token {
+    pub kind: TokenKind,
+    pub span: Span,
+}
+
+#[derive(Debug, PartialEq, Clone)]
 pub enum TokenKind {
+    Operator(String),
     Identifier(String),
     StringLiteral(String),
     NumberLiteral(f64),
@@ -34,8 +64,10 @@ pub enum TokenKind {
 pub struct Tokenizer<'a> {
     input_characters: Peekable<Chars<'a>>,
     current_position: Position,
+    cached_next_token: Option<Token>,
 }
 
+#[derive(Debug)]
 pub(crate) enum TokenizeError {
     UnexpectedCharacter(char),
     InvalidEscapeSequence(char),
@@ -53,6 +85,7 @@ impl<'a> Tokenizer<'a> {
                 column_number: 1,
                 character_index: 0,
             },
+            cached_next_token: None,
         }
     }
 
@@ -94,7 +127,15 @@ impl<'a> Tokenizer<'a> {
         }
     }
 
-    pub fn next_token(&mut self) -> Result<Option<Token>, TokenizeError> {
+    pub(crate) fn next_token(&mut self) -> Result<Option<Token>, TokenizeError> {
+        if let Some(token) = self.cached_next_token.take() {
+            return Ok(Some(token));
+        } else {
+            self.read_next_token()
+        }
+    }
+
+    fn read_next_token(&mut self) -> Result<Option<Token>, TokenizeError> {
         self.skip_whitespace();
 
         if let Some(&character) = self.input_characters.peek() {
@@ -147,26 +188,37 @@ impl<'a> Tokenizer<'a> {
                 }
                 '"' => self.parse_string_literal(),
                 '0'..='9' => self.parse_number_literal(),
-                character if character.is_alphabetic() || character == '_' => {
-                    Ok(self.parse_identifier())
+                character if character.is_alphanumeric() || character == '_' => {
+                    Ok(self.parse_alphanumeric_identifier())
                 }
+                character if !character.is_whitespace() => Ok(self.parse_operator()),
                 _ => Err(TokenizeError::UnexpectedCharacter(character)),
             }?;
 
             Ok(Some(Token {
                 kind: token,
-                start_position,
-                end_position: self.current_position,
+                span: Span {
+                    start: start_position,
+                    end: self.current_position,
+                },
             }))
         } else {
             Ok(None)
         }
     }
 
-    fn parse_identifier(&mut self) -> TokenKind {
+    fn parse_alphanumeric_identifier(&mut self) -> TokenKind {
         let identifier =
             self.consume_while(|character| character.is_alphanumeric() || character == '_');
         TokenKind::Identifier(identifier)
+    }
+
+    fn parse_operator(&mut self) -> TokenKind {
+        let identifier = self.consume_while(|character| {
+            !character.is_whitespace()
+                && !['(', ')', '.', ':', ',', '{', '}', '[', ']'].contains(&character)
+        });
+        TokenKind::Operator(identifier)
     }
 
     fn parse_string_literal(&mut self) -> Result<TokenKind, TokenizeError> {
@@ -239,6 +291,17 @@ impl<'a> Tokenizer<'a> {
             .parse::<f64>()
             .map(TokenKind::NumberLiteral)
             .map_err(|error| TokenizeError::FailedToParseNumber(format!("{}", error)))
+    }
+
+    pub(crate) fn peek_token(&mut self) -> Result<Option<Token>, TokenizeError> {
+        if let Some(token) = self.cached_next_token.as_ref() {
+            return Ok(Some(token.clone()));
+        } else if let Some(token) = self.read_next_token()? {
+            self.cached_next_token = Some(token.clone());
+            Ok(Some(token))
+        } else {
+            Ok(None)
+        }
     }
 }
 
